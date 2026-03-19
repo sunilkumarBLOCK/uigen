@@ -11,16 +11,19 @@ UIGen is an AI-powered React component generator with live preview. Users descri
 - `npm run dev` — Start dev server (Turbopack, requires `node-compat.cjs` via NODE_OPTIONS)
 - `npm run dev:daemon` — Start dev server in background, logs to `logs.txt`
 - `npm run build` — Production build
+- `npm run start` — Start production server
 - `npm run lint` — ESLint
-- `npm run test` — Run all tests (Vitest)
+- `npm run test` — Run all tests in watch mode (Vitest)
+- `npx vitest run` — Run all tests once (no watch)
 - `npx vitest src/lib/__tests__/file-system.test.ts` — Run a single test file
 - `npx vitest file-system` — Run tests matching a name pattern
 - `npm run setup` — Install deps + generate Prisma client + run migrations
 - `npm run db:reset` — Reset database
+- `npx prisma generate` — Regenerate Prisma client (needed after schema changes)
 
 ## Tech Stack
 
-- **Framework**: Next.js 15.3 (App Router, Turbopack, Server Components & Actions)
+- **Framework**: Next.js 16 (App Router, Turbopack, Server Components & Actions)
 - **Language**: TypeScript (strict mode)
 - **React**: 19
 - **Styling**: Tailwind CSS v4 via `cn()` utility (clsx + tailwind-merge)
@@ -71,11 +74,15 @@ React Context API with two main contexts:
 
 ### Authentication
 
-JWT stored in HTTP-only `auth-token` cookie (7-day expiry). Middleware (`src/middleware.ts`) protects `/api/projects` and `/api/filesystem`. Anonymous users can work without auth; their work is tracked in sessionStorage via keys `uigen_has_anon_work` and `uigen_anon_data` (see `src/lib/anon-work-tracker.ts`) and migrates on sign-in. `JWT_SECRET` env var falls back to `"development-secret-key"` in dev.
+JWT stored in HTTP-only `auth-token` cookie (7-day expiry). Core auth utilities (`createSession`, `getSession`, `deleteSession`, `verifySession`) live in `src/lib/auth.ts` (server-only). Middleware (`src/middleware.ts`) protects `/api/projects` and `/api/filesystem` paths. Anonymous users can work without auth; their work is tracked in sessionStorage via keys `uigen_has_anon_work` and `uigen_anon_data` (see `src/lib/anon-work-tracker.ts`). The `useAuth` hook (`src/hooks/use-auth.ts`) orchestrates client-side auth flows including anonymous work migration on sign-in and post-auth project routing. `JWT_SECRET` env var falls back to `"development-secret-key"` in dev.
 
 ### Virtual File System
 
 `VirtualFileSystem` class in `src/lib/file-system.ts` — Map-based in-memory tree with `/` root. Key methods: `createFileWithParents`, `viewFile`, `replaceInFile` (replaces ALL occurrences), `insertInFile`, `serialize`/`deserialize`. A singleton `fileSystem` is exported for server-side use.
+
+### Database Client
+
+`src/lib/prisma.ts` exports a singleton Prisma client using the `globalForPrisma` pattern for dev hot-reload safety. Imported by actions and API routes.
 
 ### AI Integration
 
@@ -129,6 +136,7 @@ JWT stored in HTTP-only `auth-token` cookie (7-day expiry). Middleware (`src/mid
 - `src/lib/transform/` — Babel JSX transformation pipeline
 - `src/lib/contexts/` — React context providers
 - `src/lib/prompts/` — AI system prompts
+- `src/hooks/` — Custom hooks (e.g., `use-auth.ts` for auth flows and anonymous work migration)
 
 ## Database
 
