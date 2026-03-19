@@ -1,8 +1,22 @@
-# UIGen - Project Instructions
+# CLAUDE.md
+
+This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
 
 ## Overview
 
 UIGen is an AI-powered React component generator with live preview. Users describe components in a chat interface, and Claude generates code in real-time using a virtual file system, with instant iframe-based preview.
+
+## Commands
+
+- `npm run dev` — Start dev server (Turbopack, requires `node-compat.cjs` via NODE_OPTIONS)
+- `npm run dev:daemon` — Start dev server in background, logs to `logs.txt`
+- `npm run build` — Production build
+- `npm run lint` — ESLint
+- `npm run test` — Run all tests (Vitest)
+- `npx vitest src/lib/__tests__/file-system.test.ts` — Run a single test file
+- `npx vitest file-system` — Run tests matching a name pattern
+- `npm run setup` — Install deps + generate Prisma client + run migrations
+- `npm run db:reset` — Reset database
 
 ## Tech Stack
 
@@ -11,76 +25,80 @@ UIGen is an AI-powered React component generator with live preview. Users descri
 - **React**: 19
 - **Styling**: Tailwind CSS v4 via `cn()` utility (clsx + tailwind-merge)
 - **UI Components**: shadcn/ui (New York style, Radix UI primitives)
-- **Database**: SQLite via Prisma 6.10
+- **Database**: SQLite via Prisma 6.10 (generated client at `src/generated/prisma/`)
 - **Auth**: JWT (jose) + bcrypt, HTTP-only cookies
 - **AI**: Vercel AI SDK 4.3 with @ai-sdk/anthropic (Claude Haiku-4-5)
 - **Editor**: Monaco Editor (@monaco-editor/react)
 - **Testing**: Vitest + React Testing Library + jsdom
 - **Icons**: lucide-react
 
-## Commands
-
-- `npm run dev` — Start dev server (Turbopack)
-- `npm run build` — Production build
-- `npm run test` — Run tests (Vitest)
-- `npm run lint` — ESLint
-- `npm run setup` — Install deps + generate Prisma client + run migrations
-- `npm run db:reset` — Reset database
-
 ## Architecture
 
-```
-src/
-  app/                    # Next.js App Router pages & API routes
-    api/chat/route.ts     # AI streaming endpoint (POST)
-    [projectId]/page.tsx  # Dynamic project pages
-  actions/                # Server actions ("use server") — one per file, re-exported from index.ts
-  components/             # React components (PascalCase files)
-    chat/                 # Chat UI (ChatInterface, MessageInput, MessageList)
-    editor/               # Code editor (CodeEditor, FileTree)
-    preview/              # Iframe preview (PreviewFrame)
-    ui/                   # shadcn/ui primitives (button, dialog, input, etc.)
-    auth/                 # Auth dialogs (AuthDialog, SignInForm, SignUpForm)
-  lib/
-    contexts/             # React Context providers (chat-context, file-system-context)
-    prompts/              # AI system prompts
-    tools/                # AI tool definitions (str-replace, file-manager)
-    auth.ts               # JWT session management
-    file-system.ts        # VirtualFileSystem class (in-memory tree)
-    prisma.ts             # Prisma client singleton
-    provider.ts           # AI model provider (real or mock based on API key)
-    utils.ts              # cn() utility
-  hooks/                  # Custom hooks (use-auth)
-  generated/prisma/       # Generated Prisma client (do not edit)
-prisma/
-  schema.prisma           # Database schema (User, Project models)
-```
+### Request Flow
 
-## Key Patterns
+1. User types in chat → `ChatContext` sends POST to `/api/chat` with messages + serialized VFS
+2. `/api/chat/route.ts` streams AI response via `streamText()` with two tools: `str_replace_editor` and `file_manager`
+3. AI tool calls mutate the `VirtualFileSystem` instance on the server; `onFinish` persists state to SQLite for authenticated users
+4. Client-side `FileSystemContext.handleToolCall()` mirrors tool calls into the client VFS, triggering re-renders
+5. `PreviewFrame` detects VFS changes via `refreshTrigger`, transforms all files through the JSX pipeline, and updates `iframe.srcdoc`
+
+### Preview Pipeline (non-obvious)
+
+`PreviewFrame` → `jsx-transformer.ts` — a two-pass Babel transform system:
+- **Pass 1**: Transform all JSX/TSX files with `@babel/standalone`, create `blob:` URLs, map path variations (with/without extension, `@/` alias, leading `/`)
+- **Pass 2**: Create placeholder modules for unresolved imports, map third-party packages to `https://esm.sh/` CDN
+- Output: full HTML document with Tailwind CDN, import map, error boundary, and dynamic entry point import
+
+Entry point discovery order: `/App.jsx` → `/App.tsx` → `/index.jsx` → `/index.tsx` → `/src/App.*` → first `.jsx`/`.tsx` file.
+
+### Routing
+
+- `/` — Home page; redirects authenticated users to their project
+- `/[projectId]` — Project page (requires auth, redirects to `/` if unauthenticated or project not found)
+- `/api/chat` — POST endpoint for AI streaming (`maxDuration = 120`)
+
+Both routes render `MainContent` (`src/app/main-content.tsx`), a shared client component with resizable panels (chat, editor, preview).
 
 ### Server Actions
-Each action is in its own file under `src/actions/`, uses `"use server"` directive, checks auth via `getSession()`, and is re-exported from `src/actions/index.ts`.
+
+Auth actions (`signUp`, `signIn`, `signOut`, `getUser`) live directly in `src/actions/index.ts`. Project actions (`createProject`, `getProject`, `getProjects`) are in separate files under `src/actions/` and imported directly from their own files (not re-exported from index).
 
 ### State Management
+
 React Context API with two main contexts:
-- **ChatContext** — wraps Vercel AI SDK's `useChat`, manages messages and streaming state
-- **FileSystemContext** — virtual file system state, selected file, tool call handling
+- **ChatContext** (`src/lib/contexts/chat-context.tsx`) — wraps Vercel AI SDK's `useChat`, sends serialized VFS with every request, delegates `onToolCall` to FileSystemContext
+- **FileSystemContext** (`src/lib/contexts/file-system-context.tsx`) — manages VirtualFileSystem state, selected file, wraps all VFS operations to trigger re-renders via `refreshTrigger` counter
 
 ### Authentication
-JWT stored in HTTP-only `auth-token` cookie (7-day expiry). Middleware protects `/api/projects` and `/api/filesystem`. Anonymous users can work without auth; their work migrates on sign-in via sessionStorage.
 
-### AI Integration
-POST `/api/chat` streams responses using `streamText()`. Two AI tools: `str_replace_editor` (view/create/edit files) and `file_manager` (rename/delete). Without `ANTHROPIC_API_KEY`, a mock provider returns static examples.
+JWT stored in HTTP-only `auth-token` cookie (7-day expiry). Middleware (`src/middleware.ts`) protects `/api/projects` and `/api/filesystem`. Anonymous users can work without auth; their work is tracked in sessionStorage via keys `uigen_has_anon_work` and `uigen_anon_data` (see `src/lib/anon-work-tracker.ts`) and migrates on sign-in. `JWT_SECRET` env var falls back to `"development-secret-key"` in dev.
 
 ### Virtual File System
-`VirtualFileSystem` class in `src/lib/file-system.ts` — Map-based in-memory tree with serialization support. Persisted as JSON string in the Project model's `data` field.
+
+`VirtualFileSystem` class in `src/lib/file-system.ts` — Map-based in-memory tree with `/` root. Key methods: `createFileWithParents`, `viewFile`, `replaceInFile` (replaces ALL occurrences), `insertInFile`, `serialize`/`deserialize`. A singleton `fileSystem` is exported for server-side use.
+
+### AI Integration
+
+- `src/lib/provider.ts`: `getLanguageModel()` returns real Anthropic model if `ANTHROPIC_API_KEY` is set, otherwise `MockLanguageModel` that generates static counter/form/card examples
+- `maxSteps`: 4 for mock provider, 40 for real API; `maxTokens`: 10,000
+- AI system prompt (`src/lib/prompts/generation.tsx`): requires `/App.jsx` as root entry point, Tailwind for styling, no HTML files, `@/` import alias
+- AI tools are defined in `src/lib/tools/` — `str-replace.ts` and `file-manager.ts`, using Zod schemas for parameter validation
+
+### Node Compatibility
+
+`node-compat.cjs` is loaded via `NODE_OPTIONS='--require ./node-compat.cjs'` in dev/build/start scripts. It deletes `globalThis.localStorage`/`sessionStorage` on the server to fix Node.js 25+ SSR compatibility where these exist but are non-functional.
+
+## Environment Variables
+
+- `ANTHROPIC_API_KEY` — Optional. Without it, mock provider returns static examples
+- `JWT_SECRET` — Optional. Falls back to `"development-secret-key"`
 
 ## Code Conventions
 
 ### File Naming
 - **Components**: PascalCase (`ChatInterface.tsx`)
 - **Utilities/hooks/contexts/actions**: kebab-case (`file-system.ts`, `use-auth.ts`, `chat-context.tsx`, `create-project.ts`)
-- **Tests**: `__tests__/` directory, same base name with `.test.tsx` or `.test.ts`
+- **Tests**: `__tests__/` directory alongside source, same base name with `.test.tsx` or `.test.ts`
 
 ### Code Style
 - Arrow functions for components and utilities
@@ -92,14 +110,30 @@ POST `/api/chat` streams responses using `streamText()`. Two AI tools: `str_repl
 - async/await over `.then()` chains
 - Explicit TypeScript types (strict mode enabled)
 
-### Testing
-- Vitest with jsdom environment
-- React Testing Library for component tests
-- `vi.mock()` for mocking hooks and context
+### Testing Patterns
+- Vitest with jsdom environment, configured in `vitest.config.mts`
+- `vite-tsconfig-paths` plugin enables `@/*` alias in tests
+- `afterEach(() => cleanup())` in component tests
+- `beforeEach(() => vi.clearAllMocks())` when mocks are used
+- Component tests mock child components and context hooks via `vi.mock()`
 - `@testing-library/user-event` for interaction simulation
+
+## Key Directories
+
+- `src/components/auth/` — Auth dialog, sign-in/sign-up forms
+- `src/components/chat/` — Chat interface, message list, input, markdown renderer
+- `src/components/editor/` — Code editor (Monaco), file tree
+- `src/components/preview/` — Preview iframe with JSX transform pipeline
+- `src/components/ui/` — shadcn/ui primitives
+- `src/lib/tools/` — AI tool definitions (str-replace, file-manager)
+- `src/lib/transform/` — Babel JSX transformation pipeline
+- `src/lib/contexts/` — React context providers
+- `src/lib/prompts/` — AI system prompts
 
 ## Database
 
-SQLite with two models:
+SQLite with Prisma; schema at `prisma/schema.prisma`, generated client at `src/generated/prisma/`.
+
+Two models:
 - **User**: id (cuid), email (unique), password (bcrypt), projects relation
 - **Project**: id (cuid), name, userId (optional for anonymous), messages (JSON string), data (JSON string for VFS), user relation (cascade delete)
