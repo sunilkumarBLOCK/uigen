@@ -1,6 +1,7 @@
 import type { FileNode } from "@/lib/file-system";
 import { VirtualFileSystem } from "@/lib/file-system";
-import { streamText, appendResponseMessages } from "ai";
+import { streamText, convertToModelMessages, stepCountIs } from "ai";
+import type { UIMessage } from "ai";
 import { buildStrReplaceTool } from "@/lib/tools/str-replace";
 import { buildFileManagerTool } from "@/lib/tools/file-manager";
 import { prisma } from "@/lib/prisma";
@@ -10,13 +11,20 @@ import { generationPrompt } from "@/lib/prompts/generation";
 
 export async function POST(req: Request) {
   const {
-    messages,
+    messages: uiMessages,
     files,
     projectId,
-  }: { messages: any[]; files: Record<string, FileNode>; projectId?: string } =
-    await req.json();
+  }: {
+    messages: UIMessage[];
+    files: Record<string, FileNode>;
+    projectId?: string;
+  } = await req.json();
 
-  messages.unshift({
+  // Convert UI messages to model messages for streamText
+  const modelMessages = await convertToModelMessages(uiMessages);
+
+  // Add system prompt at the beginning
+  modelMessages.unshift({
     role: "system",
     content: generationPrompt,
     providerOptions: {
@@ -33,17 +41,17 @@ export async function POST(req: Request) {
   const isMockProvider = !process.env.ANTHROPIC_API_KEY;
   const result = streamText({
     model,
-    messages,
-    maxTokens: 10_000,
-    maxSteps: isMockProvider ? 4 : 40,
-    onError: (err: any) => {
+    messages: modelMessages,
+    maxOutputTokens: 10_000,
+    stopWhen: stepCountIs(isMockProvider ? 4 : 40),
+    onError: (err: unknown) => {
       console.error(err);
     },
     tools: {
       str_replace_editor: buildStrReplaceTool(fileSystem),
       file_manager: buildFileManagerTool(fileSystem),
     },
-    onFinish: async ({ response }) => {
+    onFinish: async ({ steps }) => {
       // Save to project if projectId is provided and user is authenticated
       if (projectId) {
         try {
@@ -54,13 +62,41 @@ export async function POST(req: Request) {
             return;
           }
 
-          // Get the messages from the response
-          const responseMessages = response.messages || [];
-          // Combine original messages with response messages
-          const allMessages = appendResponseMessages({
-            messages: [...messages.filter((m) => m.role !== "system")],
-            responseMessages,
-          });
+          // Build UIMessage-format assistant message from response steps
+          const assistantParts: Array<Record<string, unknown>> = [];
+          for (const step of steps) {
+            if (step.text) {
+              assistantParts.push({ type: "text", text: step.text });
+            }
+            for (const tc of step.toolCalls) {
+              const result = step.toolResults.find(
+                (r) => r.toolCallId === tc.toolCallId
+              );
+              assistantParts.push({
+                type: "tool-invocation",
+                toolInvocation: {
+                  toolCallId: tc.toolCallId,
+                  toolName: tc.toolName,
+                  args: tc.args,
+                  state: "result",
+                  result: result?.result,
+                },
+              });
+            }
+          }
+
+          const allMessages = [
+            ...uiMessages,
+            ...(assistantParts.length > 0
+              ? [
+                  {
+                    id: crypto.randomUUID(),
+                    role: "assistant" as const,
+                    parts: assistantParts,
+                  },
+                ]
+              : []),
+          ];
 
           await prisma.project.update({
             where: {
@@ -79,7 +115,7 @@ export async function POST(req: Request) {
     },
   });
 
-  return result.toDataStreamResponse();
+  return result.toUIMessageStreamResponse();
 }
 
 export const maxDuration = 120;
